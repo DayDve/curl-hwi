@@ -211,7 +211,7 @@ for dev_path in /sys/class/block/*; do
     STR_STORAGE+="  - /dev/$devname: [yellow]$size_gb GB[/yellow] ($model)"$'\n'
 done
 
-# Logical Volumes, RAID & Btrfs
+# Logical Volumes, RAID & Btrfs (Tree view)
 STR_LOGICAL=""
 # MD RAID
 if [[ -f /proc/mdstat ]]; then
@@ -225,6 +225,16 @@ if [[ -f /proc/mdstat ]]; then
         else
             STR_LOGICAL+="  - /dev/$dev: $status"$'\n'
         fi
+        # Slaves (Tree)
+        slaves=( /sys/class/block/"$dev"/slaves/* )
+        scount=${#slaves[@]}
+        for ((i=0; i<scount; i++)); do
+            [[ ! -e "${slaves[$i]}" ]] && continue
+            sdev="${slaves[$i]##*/}"
+            char="├─"
+            [[ $i -eq $((scount-1)) ]] && char="└─"
+            STR_LOGICAL+="    $char $sdev"$'\n'
+        done
     done < /proc/mdstat
 fi
 # LVM / Device Mapper
@@ -235,6 +245,18 @@ for dm_path in /sys/class/block/dm-*; do
     size_gb=$(( sectors * 512 / 1073741824 ))
     [[ $size_gb -eq 0 ]] && continue
     STR_LOGICAL+="  - /dev/mapper/$dm_name: [yellow]$size_gb GB[/yellow] (LVM/DM)"$'\n'
+    # Slaves (Tree)
+    slaves=( "$dm_path/slaves"/* )
+    scount=${#slaves[@]}
+    for ((i=0; i<scount; i++)); do
+        [[ ! -e "${slaves[$i]}" ]] && continue
+        sdev="${slaves[$i]##*/}"
+        # If it's another dm, show its mapper name
+        [[ "$sdev" == dm-* ]] && sdev="mapper/$(cat "/sys/class/block/$sdev/dm/name" 2>/dev/null || echo "$sdev")"
+        char="├─"
+        [[ $i -eq $((scount-1)) ]] && char="└─"
+        STR_LOGICAL+="    $char $sdev"$'\n'
+    done
 done
 # Btrfs Pools
 if [[ -d /sys/fs/btrfs ]]; then
@@ -242,22 +264,21 @@ if [[ -d /sys/fs/btrfs ]]; then
         [[ -f "$fs_path/label" ]] || continue
         uuid="${fs_path##*/}"
         label=$(cat "$fs_path/label" 2>/dev/null || echo "N/A")
-        
-        # Profile detection
         profile="single"
         for p in raid0 raid1 raid10 raid5 raid6 dup; do
-            if [[ -d "$fs_path/allocation/data/$p" ]]; then
-                profile="$p"
-                break
-            fi
+            [[ -d "$fs_path/allocation/data/$p" ]] && { profile="$p"; break; }
         done
-        
-        # Devices list
-        devs=""
-        for d in "$fs_path/devices"/*; do
-            devs+="${d##*/}, "
+        STR_LOGICAL+="  - Btrfs Pool: Label: [cyan]${label}[/cyan], Profile: [yellow]${profile}[/yellow]"$'\n'
+        # Devices (Tree)
+        devs=( "$fs_path/devices"/* )
+        dcount=${#devs[@]}
+        for ((i=0; i<dcount; i++)); do
+            [[ ! -e "${devs[$i]}" ]] && continue
+            sdev="${devs[$i]##*/}"
+            char="├─"
+            [[ $i -eq $((dcount-1)) ]] && char="└─"
+            STR_LOGICAL+="    $char $sdev"$'\n'
         done
-        STR_LOGICAL+="  - Btrfs Pool: Label: [cyan]${label}[/cyan], Profile: [yellow]${profile}[/yellow], Devices: [${devs%, }]"$'\n'
     done
 fi
 
