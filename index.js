@@ -39,7 +39,7 @@ export default {
     <div class="cmd-box">curl -s https://hwi.smbit.pro | bash</div>
     
     <div class="fallback">
-        <p>Fallback URL:</p>
+        <p>Fallback URL (если основной отдает капчу):</p>
         <div class="cmd-box">curl -sL https://tinyurl.com/hw-info | bash</div>
     </div>
 </body>
