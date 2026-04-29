@@ -197,18 +197,69 @@ if [[ -f /sys/block/zram0/disksize ]]; then
 fi
 [[ $swp_t -gt 0 ]] && RAM_STR+=", Swap: $(( (swp_t - swp_f) / 1024 ))/$((swp_t / 1024)) GB"
 
-# Storage
+# Physical Storage
 STR_STORAGE=""
 for dev_path in /sys/class/block/*; do
     devname="${dev_path##*/}"
-    [[ "$devname" =~ ^(loop|ram|sr|nbd) ]] && continue
+    [[ "$devname" =~ ^(loop|ram|sr|nbd|md|dm-|zram) ]] && continue
     [[ -f "$dev_path/partition" ]] && continue
     sectors=$(cat "$dev_path/size" 2>/dev/null || continue)
     size_gb=$(( sectors * 512 / 1073741824 ))
+    [[ $size_gb -eq 0 ]] && continue
     model=$(trim "$(cat "$dev_path/device/model" 2>/dev/null || echo "")")
     [[ -z "$model" ]] && model="N/A"
     STR_STORAGE+="  - /dev/$devname: [yellow]$size_gb GB[/yellow] ($model)"$'\n'
 done
+
+# Logical Volumes, RAID & Btrfs
+STR_LOGICAL=""
+# MD RAID
+if [[ -f /proc/mdstat ]]; then
+    while read -r line; do
+        [[ "$line" =~ ^md[0-9] ]] || continue
+        dev="${line%% :*}"
+        status="${line#* : }"
+        if [[ -f "/sys/class/block/$dev/size" ]]; then
+            s=$(cat "/sys/class/block/$dev/size")
+            STR_LOGICAL+="  - /dev/$dev: [yellow]$(( s * 512 / 1073741824 )) GB[/yellow] ($status)"$'\n'
+        else
+            STR_LOGICAL+="  - /dev/$dev: $status"$'\n'
+        fi
+    done < /proc/mdstat
+fi
+# LVM / Device Mapper
+for dm_path in /sys/class/block/dm-*; do
+    [[ -d "$dm_path/dm" ]] || continue
+    dm_name=$(cat "$dm_path/dm/name" 2>/dev/null || continue)
+    sectors=$(cat "$dm_path/size" 2>/dev/null || continue)
+    size_gb=$(( sectors * 512 / 1073741824 ))
+    [[ $size_gb -eq 0 ]] && continue
+    STR_LOGICAL+="  - /dev/mapper/$dm_name: [yellow]$size_gb GB[/yellow] (LVM/DM)"$'\n'
+done
+# Btrfs Pools
+if [[ -d /sys/fs/btrfs ]]; then
+    for fs_path in /sys/fs/btrfs/*; do
+        [[ -f "$fs_path/label" ]] || continue
+        uuid="${fs_path##*/}"
+        label=$(cat "$fs_path/label" 2>/dev/null || echo "N/A")
+        
+        # Profile detection
+        profile="single"
+        for p in raid0 raid1 raid10 raid5 raid6 dup; do
+            if [[ -d "$fs_path/allocation/data/$p" ]]; then
+                profile="$p"
+                break
+            fi
+        done
+        
+        # Devices list
+        devs=""
+        for d in "$fs_path/devices"/*; do
+            devs+="${d##*/}, "
+        done
+        STR_LOGICAL+="  - Btrfs Pool: Label: [cyan]${label}[/cyan], Profile: [yellow]${profile}[/yellow], Devices: [${devs%, }]"$'\n'
+    done
+fi
 
 # Partitions
 STR_FS=""
@@ -311,7 +362,7 @@ if $SHOW_LOGO; then
          ░▀▀█░░█░░▀▀█░░█░░█▀▀░█░█░░░█▀▄░█▀▀░█▀▀░█░█░█▀▄░░█░░
          ░▀▀▀░░▀░░▀▀▀░░▀░░▀▀▀░▀░▀░░░▀░▀░▀▀▀░▀░░░▀▀▀░▀░▀░░▀░░
                                                              
-       ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+         ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
 [/cyan][/bold]"$'\n'
 fi
 
@@ -328,7 +379,8 @@ REPORT+="${STR_BATTERY}"
 REPORT+="[bold][blue][CPU]:[/blue][/bold]     $CPU_MODEL ($CPU_CORES cores) @ [yellow]$TEMP[/yellow]"$'\n'
 REPORT+="[bold][blue][RAM]:[/blue][/bold]     $RAM_STR"$'\n'
 REPORT+="${STR_GPU}"
-REPORT+="[bold][blue][Storage]:[/blue][/bold]"$'\n'"$STR_STORAGE"
+REPORT+="[bold][blue][Physical Storage]:[/blue][/bold]"$'\n'"$STR_STORAGE"
+[[ -n "$STR_LOGICAL" ]] && REPORT+="[bold][blue][Logical Volumes & RAID]:[/blue][/bold]"$'\n'"$STR_LOGICAL"
 REPORT+="[bold][blue][Partitions & FS]:[/blue][/bold]"$'\n'"$STR_FS"
 REPORT+="[bold][blue][Network]:[/blue][/bold]"$'\n'"$STR_NET"
 REPORT+="${STR_EXT}"
