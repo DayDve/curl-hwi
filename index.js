@@ -36,7 +36,7 @@ export default {
 <body>
     <h1>HardWare Inspector (report generator)</h1>
     <p>Для получения сводного отчета выполните команду:</p>
-    <div class="cmd-box">curl -A "HWI" -s https://hwi.smbit.pro | bash</div>
+    <div class="cmd-box">curl -s https://hwi.smbit.pro | bash</div>
     
     <div class="fallback">
         <p>Fallback URL:</p>
