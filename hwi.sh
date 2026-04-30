@@ -220,11 +220,7 @@ render_block() {
     fi
 
     local mnt_raw=$(trim "${MOUNTS[$dev]:-}")
-    local mnt_str=""
-    [[ -n "$mnt_raw" ]] && mnt_str=" -> [cyan]${mnt_raw// /, }[/cyan]"
-
-    STR_STORAGE+="${indent}${char} ${display_name}: [yellow]$(format_size "$sectors")[/yellow] ${details}${mnt_str}"$'\n'
-
+    local mnts=($mnt_raw)
     local children=()
     if [[ "$is_root" == "true" ]]; then
         for p_path in "$path"/*; do
@@ -236,13 +232,29 @@ render_block() {
         done
     fi
 
+    # Print device line
+    STR_STORAGE+="${indent}${char} ${display_name}: [yellow]$(format_size "$sectors")[/yellow] ${details}"$'\n'
+
+    # Children indentation
     local next_indent="${indent}│  "
     [[ "$is_last" == "true" || "$is_root" == "true" ]] && next_indent="${indent}   "
     [[ "$is_root" == "true" ]] && next_indent="  "
 
-    local count=${#children[@]}
-    for ((i=0; i<count; i++)); do
-        local last="false"; [[ $i -eq $((count-1)) ]] && last="true"
+    local m_count=${#mnts[@]}
+    local h_count=${#children[@]}
+    local total=$((m_count + h_count))
+
+    # Render Mounts
+    for ((i=0; i<m_count; i++)); do
+        local m_char="├─"
+        [[ $((i + 1)) -eq $total ]] && m_char="└─"
+        STR_STORAGE+="${next_indent}${m_char} [cyan]${mnts[$i]}[/cyan]"$'\n'
+    done
+
+    # Render Holders
+    for ((i=0; i<h_count; i++)); do
+        local last="false"
+        [[ $((i + m_count + 1)) -eq $total ]] && last="true"
         render_block "${children[$i]}" "$next_indent" "$last" "false"
     done
 }
