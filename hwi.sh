@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HardWare Inspector (Improved Storage & RAID Tree)
+# HardWare Inspector (High Performance Storage Tree)
 # Minimal dependencies, maximum speed.
 
 set -Eeuo pipefail
@@ -92,11 +92,8 @@ RAM_STR="N/A"
 
 log_step "OS & Kernel"
 OS_NAME="Linux"
-if [[ -f /etc/os-release ]]; then
-    OS_NAME=$(grep "^PRETTY_NAME=" /etc/os-release | cut -d= -f2- | tr -d '"' || echo "Linux")
-fi
-KERNEL=$(uname -r)
-ARCH=$(uname -m)
+[[ -f /etc/os-release ]] && OS_NAME=$(grep "^PRETTY_NAME=" /etc/os-release | cut -d= -f2- | tr -d '"' || echo "Linux")
+KERNEL=$(uname -r); ARCH=$(uname -m)
 HOSTNAME=$(hostname 2>/dev/null || echo "${HOSTNAME:-Unknown}")
 LOCAL_TIME=$(date "+%Y-%m-%d %H:%M:%S %Z")
 PROCS=$(ls -d /proc/[0-9]* 2>/dev/null | wc -l || echo "N/A")
@@ -117,26 +114,19 @@ fi
 
 log_step "Uptime & CPU"
 read -r up_sec _ < /proc/uptime || up_sec=0
-up_d=$(( ${up_sec%.*} / 86400 ))
-up_h=$(( (${up_sec%.*} % 86400) / 3600 ))
-up_m=$(( (${up_sec%.*} % 3600) / 60 ))
+up_d=$(( ${up_sec%.*} / 86400 )); up_h=$(( (${up_sec%.*} % 86400) / 3600 )); up_m=$(( (${up_sec%.*} % 3600) / 60 ))
 UPTIME="${up_d}d ${up_h}h ${up_m}m"
 read -r l1 l2 l3 _ < /proc/loadavg || l1="N/A"; l2="N/A"; l3="N/A"
 LOAD="$l1, $l2, $l3"
 
-CPU_MODEL="Unknown"
-CPU_CORES=0
+CPU_MODEL="Unknown"; CPU_CORES=0
 if [[ -f /proc/cpuinfo ]]; then
     while read -r line; do
-        if [[ $line == "model name"* ]]; then
-            CPU_MODEL="${line#*: }"
-        elif [[ $line == "processor"* ]]; then
-            ((++CPU_CORES))
-        fi
+        [[ $line == "model name"* ]] && CPU_MODEL="${line#*: }"
+        [[ $line == "processor"* ]] && ((++CPU_CORES))
     done < /proc/cpuinfo
 fi
 CPU_MODEL=$(trim "$CPU_MODEL")
-
 TEMP="N/A"
 if [[ -f /sys/class/thermal/thermal_zone0/temp ]]; then
     raw_temp=$(cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null || echo "0")
@@ -164,6 +154,7 @@ if [[ -f /proc/mounts ]]; then
     while read -r dev mnt _; do
         [[ "$dev" == /dev/* ]] || continue
         node="${dev##*/}"
+        # Skip readlink for common paths to speed up
         [[ "$dev" == /dev/mapper/* || -L "$dev" ]] && {
             real_dev=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
             node="${real_dev##*/}"
@@ -174,6 +165,7 @@ fi
 
 # --- 2. Storage Tree ---
 log_step "Storage Tree"
+declare -A PROCESSED_DEVS
 
 format_size() {
     local sectors="$1"
@@ -197,8 +189,14 @@ render_block() {
     local is_root="${4:-false}"
     local call_stack="${5:-}"
 
-    # Infinite loop protection per branch
-    [[ "$call_stack" == *" $dev "* ]] && return
+    # Global cache except for RAID (RAID should be shown under every member)
+    if [[ "$dev" != md* ]]; then
+        [[ -n "${PROCESSED_DEVS[$dev]:-}" ]] && return
+        PROCESSED_DEVS["$dev"]=1
+    else
+        # Still prevent infinite loops in RAID branch
+        [[ "$call_stack" == *" $dev "* ]] && return
+    fi
     local current_stack="$call_stack $dev "
 
     local path="/sys/class/block/$dev"
@@ -207,8 +205,7 @@ render_block() {
     local sectors=$(cat "$path/size" 2>/dev/null || echo 0)
     [[ $sectors -eq 0 && "$is_root" == "false" ]] && return
     
-    local prefix="├─ "
-    [[ "$is_last" == "true" ]] && prefix="└─ "
+    local prefix="├─ "; [[ "$is_last" == "true" ]] && prefix="└─ "
     [[ "$is_root" == "true" ]] && prefix=""
 
     local display_name="/dev/$dev"
@@ -224,22 +221,19 @@ render_block() {
     fi
 
     local mnt_raw=$(trim "${MOUNTS[$dev]:-}")
-    local mnts=($mnt_raw)
+    set -f; local mnts=($mnt_raw); set +f # Disable globbing for mount paths
     
     local children=()
     if [[ "$is_root" == "true" ]]; then
-        for p_path in "$path"/*; do
+        # Specific glob for partitions to speed up
+        for p_path in "$path"/${dev}*; do
             [[ -f "$p_path/partition" ]] && children+=("${p_path##*/}")
         done
-        # Also check if disk itself is a holder (rare but possible for raid on disks)
-        for h_path in "$path/holders"/*; do
-            [[ -d "$h_path" ]] && children+=("${h_path##*/}")
-        done
-    else
-        for h_path in "$path/holders"/*; do
-            [[ -d "$h_path" ]] && children+=("${h_path##*/}")
-        done
     fi
+    # Always check holders
+    for h_path in "$path/holders"/*; do
+        [[ -d "$h_path" ]] && children+=("${h_path##*/}")
+    done
 
     STR_STORAGE+="${indent}${prefix}${display_name}: [yellow]$(format_size "$sectors")[/yellow] ${details}"$'\n'
 
@@ -273,32 +267,23 @@ log_step "RAID & Network"
 if [[ -f /proc/mdstat ]]; then
     while read -r line; do
         [[ "$line" =~ ^md[0-9] ]] || continue
-        dev="${line%% :*}"
-        status="${line#* : }"
-        
-        # Colorize status
-        s_color="yellow"
-        [[ "$status" == *"active"* || "$status" == *"clean"* ]] && s_color="green"
+        dev="${line%% :*}"; status="${line#* : }"
+        s_color="yellow"; [[ "$status" == *"active"* || "$status" == *"clean"* ]] && s_color="green"
         [[ "$status" == *"degraded"* || "$status" == *"FAILED"* ]] && s_color="red"
         
         sectors=$(cat "/sys/class/block/$dev/size" 2>/dev/null || echo 0)
         STR_RAID+="- /dev/$dev: [yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status[/$s_color])"$'\n'
-        
-        # Add RAID members as sub-tree
         local slaves=(/sys/class/block/$dev/slaves/*)
         local s_count=${#slaves[@]}
         for ((i=0; i<s_count; i++)); do
             s_char="├─ "; [[ $((i+1)) -eq $s_count ]] && s_char="└─ "
-            s_name="${slaves[$i]##*/}"
-            STR_RAID+="  ${s_char}${s_name}"$'\n'
+            STR_RAID+="  ${s_char}${slaves[$i]##*/}"$'\n'
         done
     done < /proc/mdstat
 fi
 
 gw=""
-if command -v ip >/dev/null; then
-    gw=$(timeout 1 ip route | awk '/default/ {print $3}' | head -n1 || echo "")
-fi
+if command -v ip >/dev/null; then gw=$(timeout 1 ip route | awk '/default/ {print $3}' | head -n1 || echo ""); fi
 [[ -n "$gw" ]] && STR_NET+="  - Default Gateway: [cyan]$gw[/cyan]"$'\n'
 
 for net_path in /sys/class/net/*; do
@@ -307,30 +292,21 @@ for net_path in /sys/class/net/*; do
     mac=$(cat "$net_path/address" 2>/dev/null || echo "Unknown")
     state=$(cat "$net_path/operstate" 2>/dev/null || echo "Unknown")
     state_color="red"; [[ "$state" == "up" ]] && state_color="green"
-    
     ssid=""
     if [[ -d "$net_path/wireless" || -d "$net_path/phy80211" ]]; then
-        if command -v iwgetid >/dev/null; then
-            ssid=$(timeout 1 iwgetid -r "$iface" 2>/dev/null || echo "")
-        elif command -v nmcli >/dev/null; then
-            ssid=$(timeout 1 nmcli --timeout 1 -t -f active,ssid dev wifi 2>/dev/null | grep "^yes" | cut -d: -f2 || echo "")
-        fi
+        if command -v iwgetid >/dev/null; then ssid=$(timeout 1 iwgetid -r "$iface" 2>/dev/null || echo "")
+        elif command -v nmcli >/dev/null; then ssid=$(timeout 1 nmcli --timeout 1 -t -f active,ssid dev wifi 2>/dev/null | grep "^yes" | cut -d: -f2 || echo ""); fi
     fi
     [[ -n "$ssid" ]] && ssid=" SSID: [yellow]$ssid[/yellow],"
-
     ips=""
-    if command -v ip >/dev/null; then
-        ips=$(timeout 1 ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 || echo "")
-    fi
+    if command -v ip >/dev/null; then ips=$(timeout 1 ip -4 addr show dev "$iface" 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 || echo ""); fi
     ips=$(trim "${ips//$'\n'/,}")
     STR_NET+="  - [yellow]$iface[/yellow]:${ssid} MAC $mac, State: [$state_color]$state[/$state_color], IP: [cyan]${ips:-None}[/cyan]"$'\n'
 done
 
 log_step "GPU & Hardware"
 if command -v lspci >/dev/null; then
-    while read -r gpu; do
-        STR_GPU+="  - $gpu"$'\n'
-    done < <(timeout 2 lspci 2>/dev/null | grep -iE 'vga|3d|display' | cut -d: -f3- | sed 's/^ //' || true)
+    while read -r gpu; do STR_GPU+="  - $gpu"$'\n'; done < <(timeout 2 lspci 2>/dev/null | grep -iE 'vga|3d|display' | cut -d: -f3- | sed 's/^ //' || true)
 fi
 [[ -n "$STR_GPU" ]] && STR_GPU="[bold][blue][GPU]:[/blue][/bold]"$'\n'"$STR_GPU"
 
