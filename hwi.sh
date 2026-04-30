@@ -42,7 +42,7 @@ cprintf() {
         t="${t//\[magenta\]/}";   t="${t//\[\/magenta\]/}"
         t="${t//\[cyan\]/}";      t="${t//\[\/cyan\]/}"
         t="${t//\[gray\]/}";      t="${t//\[\/gray\]/}"
-        printf '%b' "$t"
+        printf '%s\n' "$t"
         return
     fi
     # Process line-by-line to avoid quadratic complexity on large strings
@@ -70,7 +70,6 @@ cleanup() {
 }
 
 trap cleanup EXIT
-trap 'exit 1' ERR
 
 log_step() {
     [[ "$IS_INTERACTIVE" == "true" ]] && printf "\r\033[K${GRY}Generating report: $1...${_GRY}" >&2
@@ -115,6 +114,19 @@ if [[ -f /sys/class/dmi/id/sys_vendor ]]; then
     esac
 fi
 [[ "$VIRT" != "none" ]] && STR_VIRT="[bold][blue][Virt]:[/blue][/bold]      $VIRT"$'\n'
+
+log_step "System DMI"
+SYS_MODEL="Unknown"; MB_MODEL="Unknown"
+if [[ -f /sys/class/dmi/id/product_name ]]; then
+    vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo "")
+    product=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "")
+    SYS_MODEL=$(trim "$vendor $product")
+fi
+if [[ -f /sys/class/dmi/id/board_name ]]; then
+    b_vendor=$(cat /sys/class/dmi/id/board_vendor 2>/dev/null || echo "")
+    b_name=$(cat /sys/class/dmi/id/board_name 2>/dev/null || echo "")
+    MB_MODEL=$(trim "$b_vendor $b_name")
+fi
 
 log_step "Uptime & CPU"
 read -r up_sec _ < /proc/uptime || up_sec=0
@@ -182,96 +194,103 @@ get_dm_type() {
     [[ "$uuid" == LVM-* ]] && echo "lvm" && return; [[ "$uuid" == CRYPT-* ]] && echo "crypt" && return; echo "dm"
 }
 
-# --- Tree Rendering Helpers ---
-draw_tree_item() {
-    local indent="$1" is_f="$2" is_l="$3" has_c="$4" content="$5"
-    local c1="├"; [[ "$is_l" == "true" ]] && c1="└"; [[ "$is_f" == "true" ]] && c1="┌"
-    local c23="───"; [[ "$has_c" == "true" ]] && c23="─┬─"
-    echo -e "${indent}${c1}${c23} ${content}"
+# --- Unified Tree Rendering Engine ---
+# render_tree_node name details stack c_idx t_sibs total_children is_root
+# Sets global TREE_LINE and TREE_STACK
+render_tree_node() {
+    local name="$1" details="$2" stack="$3" c_idx="$4" t_sibs="$5" total="$6" is_root="$7"
+    local prefix=""; local n_stack=""
+    local W=$((total + 1))
+    
+    if [[ "$is_root" == "true" ]]; then
+        prefix=" ┌"; for ((i=0; i<total-1; i++)); do prefix+="┬"; done
+        while [[ ${#prefix} -lt $((W+1)) ]]; do prefix+="─"; done
+        n_stack=" "
+    else
+        prefix="$stack"
+        for ((i=0; i<t_sibs-c_idx-1; i++)); do prefix+="│"; done
+        n_stack="$prefix"
+        prefix+="└"
+        for ((i=0; i<c_idx; i++)); do prefix+="─"; done
+        if [[ $total -gt 0 ]]; then prefix+="┬"; else prefix+="─"; fi
+        # Child stack: vertical lines + (c_idx + 1) spaces to align with ┬
+        for ((i=0; i<c_idx + 1; i++)); do n_stack+=" "; done
+    fi
+    
+    TREE_LINE="${prefix}${name}"
+    [[ -n "$details" ]] && TREE_LINE+=": $details"
+    TREE_STACK="$n_stack"
 }
 
-get_next_indent() {
-    local indent="$1" is_l="$2"
-    if [[ "$is_l" == "true" ]]; then echo "${indent}  "; else echo "${indent}│ "; fi
-}
-
-declare -A PROCESSED_DEVS
-render_block() {
-    local dev="$1" indent="$2" is_l="$3" is_root="$4" is_f="$5"
+# render_storage_tree dev stack c_idx t_sibs is_root
+render_storage_tree() {
+    local dev="$1" stack="$2" c_idx="$3" t_sibs="$4" is_root="$5"
     [[ -n "${PROCESSED_DEVS[$dev]:-}" ]] && return; PROCESSED_DEVS["$dev"]=1
     
     local path="/sys/class/block/$dev"; [[ -d "$path" ]] || return
     local sectors=$(cat "$path/size" 2>/dev/null || echo 0)
     [[ $sectors -eq 0 && "$is_root" == "false" ]] && return
     
-    # Discovery
-    set -f; local mnts=( ${MOUNTS[$dev]:-} ); set +f
-    local children=()
+    local mnts=( ${MOUNTS[$dev]:-} ); local children=()
+    if [[ "$is_root" == "true" ]]; then
+        for p_path in "$path"/${dev}*; do [[ -f "$p_path/partition" ]] && children+=("${p_path##*/}"); done
+    fi
     for h_path in "$path/holders"/*; do
         [[ -d "$h_path" ]] || continue
         local hn="${h_path##*/}"
-        [[ -f "/sys/class/block/$hn/partition" ]] && continue
+        local skip=false; for c in "${children[@]}"; do [[ "$c" == "$hn" ]] && skip=true && break; done
+        [[ "$skip" == "true" ]] && continue
         children+=("$hn")
     done
     
-    local m_count=${#mnts[@]}; local h_count=${#children[@]}; local total=$((m_count + h_count))
-    local has_c=false; [[ $total -gt 0 ]] && has_c=true
-
-    local display_name="/dev/$dev"; local details=""
+    local total=$(( ${#mnts[@]} + ${#children[@]} ))
+    local display_name="/dev/$dev"; local details="[yellow]$(format_size "$sectors")[/yellow]"
     if [[ -f "$path/dm/name" ]]; then
-        display_name="/dev/mapper/$(cat "$path/dm/name")"; details="($dev, $(get_dm_type "$dev"))"
-    elif [[ -f "$path/md/level" ]]; then details="($dev, $(cat "$path/md/level" 2>/dev/null || echo "raid"))"
+        display_name="/dev/mapper/$(cat "$path/dm/name")"; details+=" ($dev, $(get_dm_type "$dev"))"
+    elif [[ -f "$path/md/level" ]]; then details+=" ($dev, $(cat "$path/md/level" 2>/dev/null || echo "raid"))"
     elif [[ -f "$path/device/model" ]]; then
         local model=$(trim "$(cat "$path/device/model" 2>/dev/null || echo "")")
-        [[ -n "$model" ]] && [[ ! "$dev" =~ [0-9]$ ]] && details="($model)"
+        [[ -n "$model" ]] && [[ ! "$dev" =~ [0-9]$ ]] && details+=" ($model)"
     fi
 
-    STR_STORAGE+="$(draw_tree_item "$indent" "$is_f" "$is_l" "$has_c" "${display_name}: [yellow]$(format_size "$sectors")[/yellow] ${details}")"$'\n'
+    render_tree_node "$display_name" "$details" "$stack" "$c_idx" "$t_sibs" "$total" "$is_root"
+    STR_STORAGE+="$TREE_LINE"$'\n'
+    local n_stack="$TREE_STACK"
 
-    local n_indent=$(get_next_indent "$indent" "$is_l")
-    for ((i=0; i<m_count; i++)); do
-        local last=false; [[ $((i + 1)) -eq $total ]] && last=true
-        STR_STORAGE+="$(draw_tree_item "$n_indent" "false" "$last" "false" "[cyan]${mnts[$i]}[/cyan]")"$'\n'
+    for ((i=0; i<${#mnts[@]}; i++)); do
+        render_tree_node "[cyan]${mnts[$i]}[/cyan]" "" "$n_stack" "$i" "$total" 0 "false"
+        STR_STORAGE+="$TREE_LINE"$'\n'
     done
-    for ((i=0; i<h_count; i++)); do
-        local last=false; [[ $((i + m_count + 1)) -eq $total ]] && last=true
-        render_block "${children[$i]}" "$n_indent" "$last" "false" "false"
+    for ((i=0; i<${#children[@]}; i++)); do
+        render_storage_tree "${children[$i]}" "$n_stack" "$((i+${#mnts[@]}))" "$total" "false"
     done
 }
 
-# Flattened root collection: Disks and Partitions as siblings
 ROOT_NODES=()
 for d_path in /sys/class/block/*; do
     dn="${d_path##*/}"; [[ "$dn" =~ ^(loop|ram|sr|nbd|md|dm-|zram) ]] && continue
     [[ -f "$d_path/partition" ]] && continue
     ROOT_NODES+=("$dn")
-    for p_path in "$d_path"/${dn}*; do [[ -f "$p_path/partition" ]] && ROOT_NODES+=("${p_path##*/}"); done
 done
+for ((i=0; i<${#ROOT_NODES[@]}; i++)); do render_storage_tree "${ROOT_NODES[$i]}" "" 0 0 "true"; done
 
-RN_COUNT=${#ROOT_NODES[@]}
-for ((i=0; i<RN_COUNT; i++)); do
-    is_f=false; [[ $i -eq 0 ]] && is_f=true
-    is_l=false; [[ $((i+1)) -eq $RN_COUNT ]] && is_l=true
-    render_block "${ROOT_NODES[$i]}" "" "$is_l" "true" "$is_f"
-done
-
-log_step "RAID & Network"
+log_step "RAID Status"
+STR_RAID=""
 if [[ -f /proc/mdstat ]]; then
     while read -r line; do
         [[ "$line" =~ ^md[0-9]+ ]] || continue
-        md_dev="${line%% :*}"; 
-        rest="${line#* : }"; status_word="${rest%% *}"
+        md_dev="${line%% :*}"; rest="${line#* : }"; status_word="${rest%% *}"
         l_s="${rest#$status_word }"; raid_level="${l_s%% *}"; slaves_part="${l_s#$raid_level }"
-        
         s_color="yellow"; [[ "$status_word" == *"active"* ]] && s_color="green"
         sectors=$(cat "/sys/class/block/$md_dev/size" 2>/dev/null || echo 0)
-        STR_RAID+="- /dev/$md_dev: [yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status_word $raid_level[/$s_color])"$'\n'
-        
         read -ra slaves_arr <<< "$slaves_part"
-        s_count=${#slaves_arr[@]}
-        for ((i=0; i<s_count; i++)); do
-            s_l=false; [[ $((i+1)) -eq $s_count ]] && s_l=true
-            STR_RAID+="$(draw_tree_item "  " "false" "$s_l" "false" "${slaves_arr[$i]}")"$'\n'
+        
+        render_tree_node "/dev/$md_dev" "[yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status_word $raid_level[/$s_color])" "" 0 0 "${#slaves_arr[@]}" "true"
+        STR_RAID+="$TREE_LINE"$'\n'
+        local n_stack="$TREE_STACK"
+        for ((i=0; i<${#slaves_arr[@]}; i++)); do
+            render_tree_node "${slaves_arr[$i]}" "" "$n_stack" "$i" "${#slaves_arr[@]}" 0 "false"
+            STR_RAID+="$TREE_LINE"$'\n'
         done
     done < /proc/mdstat
 fi
@@ -335,7 +354,7 @@ if $SHOW_LOGO; then
 
      ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀[/cyan][/bold]"$'\n'
 fi
-
+# Assembly
 REPORT="${STR_LOGO}"
 REPORT+="[bold][blue][OS]:[/blue][/bold]        $OS_NAME ($ARCH)"$'\n'
 REPORT+="[bold][blue][Hostname]:[/blue][/bold]  $HOSTNAME"$'\n'
@@ -343,14 +362,15 @@ REPORT+="[bold][blue][Kernel]:[/blue][/bold]    $KERNEL"$'\n'
 REPORT+="${STR_VIRT}"
 REPORT+="[bold][blue][Uptime]:[/blue][/bold]    $UPTIME (Load: $LOAD)"$'\n'
 REPORT+="[bold][blue][Context]:[/blue][/bold]   $LOCAL_TIME (Procs: $PROCS, Entropy: $ENTROPY)"$'\n'
-REPORT+="${STR_SYS}"
+REPORT+="[bold][blue][System]:[/blue][/bold]    $SYS_MODEL"$'\n'
+REPORT+="[bold][blue][MB]:[/blue][/bold]        $MB_MODEL"$'\n'
 REPORT+="[bold][blue][CPU]:[/blue][/bold]       $CPU_MODEL ($CPU_CORES cores) @ [yellow]$TEMP[/yellow]"$'\n'
 REPORT+="[bold][blue][RAM]:[/blue][/bold]       $RAM_STR"$'\n'
-REPORT+="${STR_GPU}"
-REPORT+="[bold][blue][Storage Tree]:[/blue][/bold]"$'\n'"$STR_STORAGE"
-REPORT+="[bold][blue][RAID Status]:[/blue][/bold]"$'\n'"$STR_RAID"
-REPORT+="[bold][blue][Network]:[/blue][/bold]"$'\n'"$STR_NET"
-REPORT+="${STR_EXT}"
+REPORT+="$STR_GPU"
+REPORT+=$'\n'"[bold][blue][Storage Tree]:[/blue][/bold]"$'\n'"$STR_STORAGE"
+[[ -n "${STR_RAID//[[:space:]]/}" ]] && REPORT+=$'\n'"[bold][blue][RAID Status]:[/blue][/bold]"$'\n'"$STR_RAID"
+REPORT+=$'\n'"[bold][blue][Network]:[/blue][/bold]"$'\n'"$STR_NET"
+REPORT+=$'\n'"[bold][blue][External IP]:[/blue][/bold]  $EXT_IP"
 
 if [[ "$IS_INTERACTIVE" == "true" ]]; then
     printf "\r\033[K\033[?25h" >&2
