@@ -30,6 +30,7 @@ IS_INTERACTIVE=true
 
 cprintf() {
     local t="${1:-}"
+    [[ -n "$t" ]] || return
     if ! $USE_COLOR; then
         t="${t//\[bold\]/}";      t="${t//\[\/bold\]/}"
         t="${t//\[italic\]/}";    t="${t//\[\/italic\]/}"
@@ -44,17 +45,20 @@ cprintf() {
         printf '%b' "$t"
         return
     fi
-    t="${t//\[bold\]/$B}";      t="${t//\[\/bold\]/$_B}"
-    t="${t//\[italic\]/$I}";    t="${t//\[\/italic\]/$_I}"
-    t="${t//\[underline\]/$U}"; t="${t//\[\/underline\]/$_U}"
-    t="${t//\[red\]/$RED}";     t="${t//\[\/red\]/$_RED}"
-    t="${t//\[green\]/$GRN}";   t="${t//\[\/green\]/$_GRN}"
-    t="${t//\[yellow\]/$YLW}";  t="${t//\[\/yellow\]/$_YLW}"
-    t="${t//\[blue\]/$BLU}";    t="${t//\[\/blue\]/$_BLU}"
-    t="${t//\[magenta\]/$MAG}"; t="${t//\[\/magenta\]/$_MAG}"
-    t="${t//\[cyan\]/$CYN}";    t="${t//\[\/cyan\]/$_CYN}"
-    t="${t//\[gray\]/$GRY}";    t="${t//\[\/gray\]/$_GRY}"
-    printf '%b' "$t"
+    # Process line-by-line to avoid quadratic complexity on large strings
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line//\[bold\]/$B}";      line="${line//\[\/bold\]/$_B}"
+        line="${line//\[italic\]/$I}";    line="${line//\[\/italic\]/$_I}"
+        line="${line//\[underline\]/$U}"; line="${line//\[\/underline\]/$_U}"
+        line="${line//\[red\]/$RED}";     line="${line//\[\/red\]/$_RED}"
+        line="${line//\[green\]/$GRN}";   line="${line//\[\/green\]/$_GRN}"
+        line="${line//\[yellow\]/$YLW}";  line="${line//\[\/yellow\]/$_YLW}"
+        line="${line//\[blue\]/$BLU}";    line="${line//\[\/blue\]/$_BLU}"
+        line="${line//\[magenta\]/$MAG}"; line="${line//\[\/magenta\]/$_MAG}"
+        line="${line//\[cyan\]/$CYN}";    line="${line//\[\/cyan\]/$_CYN}"
+        line="${line//\[gray\]/$GRY}";    line="${line//\[\/gray\]/$_GRY}"
+        printf '%b\n' "$line"
+    done <<< "$t"
 }
 
 cleanup() {
@@ -220,8 +224,7 @@ render_block() {
         [[ -n "$model" ]] && details="($model)"
     fi
 
-    local mnt_raw=$(trim "${MOUNTS[$dev]:-}")
-    set -f; local mnts=($mnt_raw); set +f # Disable globbing for mount paths
+    set -f; local mnts=( ${MOUNTS[$dev]:-} ); set +f # Fast split, no trim
     
     local children=()
     if [[ "$is_root" == "true" ]]; then
