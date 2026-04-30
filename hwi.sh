@@ -198,7 +198,7 @@ get_dm_type() {
 # render_tree_node name details stack c_idx t_sibs total_children is_root is_flat
 render_tree_node() {
     local name="$1" details="$2" stack="$3" c_idx="$4" t_sibs="$5" total="$6" is_root="$7" is_flat="${8:-false}"
-    local prefix=""; local n_stack=""
+    local prefix=""; local n_stack=""; local i
     
     if [[ "$is_root" == "true" ]]; then
         local W=$((total + 1))
@@ -225,7 +225,7 @@ render_tree_node() {
 # render_storage_tree dev stack c_idx t_sibs is_root
 render_storage_tree() {
     local dev="$1" stack="$2" c_idx="$3" t_sibs="$4" is_root="$5"
-    [[ -n "${PROCESSED_DEVS[$dev]:-}" ]] && return; PROCESSED_DEVS["$dev"]=1
+    local i skip; [[ -n "${PROCESSED_DEVS[$dev]:-}" ]] && return; PROCESSED_DEVS["$dev"]=1
     
     local path="/sys/class/block/$dev"; [[ -d "$path" ]] || return
     local sectors=$(cat "$path/size" 2>/dev/null || echo 0)
@@ -233,13 +233,11 @@ render_storage_tree() {
     
     local mnts=( ${MOUNTS[$dev]:-} ); local children=()
     if [[ "$is_root" == "true" ]]; then
-        # Sorted partition discovery
         while read -r p; do children+=("$p"); done < <(ls -1d "$path"/${dev}* 2>/dev/null | xargs -n1 basename | sort -V)
     fi
-    # Sorted holders discovery
     while read -r h; do
         [[ -d "$path/holders/$h" ]] || continue
-        local skip=false; for c in "${children[@]}"; do [[ "$c" == "$h" ]] && skip=true && break; done
+        skip=false; for c in "${children[@]}"; do [[ "$c" == "$h" ]] && skip=true && break; done
         [[ "$skip" == "true" ]] && continue
         children+=("$h")
     done < <(ls -1 "$path/holders" 2>/dev/null | sort -V)
@@ -258,12 +256,10 @@ render_storage_tree() {
     STR_STORAGE+="$TREE_LINE"$'\n'
     local n_stack="$TREE_STACK"
 
-    # Mount points use FLAT style to prevent vertical line explosion
     for ((i=0; i<m_count; i++)); do
         render_tree_node "[cyan]${mnts[$i]}[/cyan]" "" "$n_stack" "$i" "$total" 0 "false" "true"
         STR_STORAGE+="$TREE_LINE"$'\n'
     done
-    # Physical children use STACKED style as requested
     for ((i=0; i<c_count; i++)); do
         render_storage_tree "${children[$i]}" "$n_stack" "$((i+m_count))" "$total" "false"
     done
@@ -275,7 +271,6 @@ for d_path in /sys/class/block/*; do
     [[ -f "$d_path/partition" ]] && continue
     ROOT_NODES+=("$dn")
 done
-# Sort root nodes too
 IFS=$'\n' ROOT_NODES=($(sort -V <<<"${ROOT_NODES[*]}")); unset IFS
 for ((i=0; i<${#ROOT_NODES[@]}; i++)); do render_storage_tree "${ROOT_NODES[$i]}" "" 0 0 "true"; done
 
@@ -290,12 +285,9 @@ if [[ -f /proc/mdstat ]]; then
         sectors=$(cat "/sys/class/block/$md_dev/size" 2>/dev/null || echo 0)
         read -ra slaves_arr <<< "$slaves_part"
         
-        render_tree_node "/dev/$md_dev" "[yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status_word $raid_level[/$s_color])" "" 0 0 "${#slaves_arr[@]}" "true"
-        STR_RAID+="$TREE_LINE"$'\n'
-        md_stack="$TREE_STACK"
+        STR_RAID+=" - /dev/$md_dev: [yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status_word $raid_level[/$s_color])"$'\n'
         for ((i=0; i<${#slaves_arr[@]}; i++)); do
-            render_tree_node "${slaves_arr[$i]}" "" "$md_stack" "$i" "${#slaves_arr[@]}" 0 "false"
-            STR_RAID+="$TREE_LINE"$'\n'
+            if [[ $((i+1)) -lt ${#slaves_arr[@]} ]]; then STR_RAID+="   ├── ${slaves_arr[$i]}"$'\n'; else STR_RAID+="   └── ${slaves_arr[$i]}"$'\n'; fi
         done
     done < /proc/mdstat
 fi
