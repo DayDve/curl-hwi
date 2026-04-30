@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HardWare Inspector (Fixed Pure Bash Edition)
+# HardWare Inspector (Improved Storage & RAID Tree)
 # Minimal dependencies, maximum speed.
 
 set -Eeuo pipefail
@@ -174,7 +174,6 @@ fi
 
 # --- 2. Storage Tree ---
 log_step "Storage Tree"
-declare -A PROCESSED_DEVS
 
 format_size() {
     local sectors="$1"
@@ -196,9 +195,11 @@ render_block() {
     local indent="$2"
     local is_last="$3"
     local is_root="${4:-false}"
-    
-    [[ -n "${PROCESSED_DEVS[$dev]:-}" ]] && return
-    PROCESSED_DEVS["$dev"]=1
+    local call_stack="${5:-}"
+
+    # Infinite loop protection per branch
+    [[ "$call_stack" == *" $dev "* ]] && return
+    local current_stack="$call_stack $dev "
 
     local path="/sys/class/block/$dev"
     [[ -d "$path" ]] || return
@@ -206,14 +207,17 @@ render_block() {
     local sectors=$(cat "$path/size" 2>/dev/null || echo 0)
     [[ $sectors -eq 0 && "$is_root" == "false" ]] && return
     
-    local char="├─"; [[ "$is_last" == "true" ]] && char="└─"
-    [[ "$is_root" == "true" ]] && char="-"
+    local prefix="├─ "
+    [[ "$is_last" == "true" ]] && prefix="└─ "
+    [[ "$is_root" == "true" ]] && prefix=""
 
     local display_name="/dev/$dev"
     local details=""
     if [[ -f "$path/dm/name" ]]; then
         display_name="/dev/mapper/$(cat "$path/dm/name")"
         details="($dev, $(get_dm_type "$dev"))"
+    elif [[ -f "$path/md/level" ]]; then
+        details="($dev, $(cat "$path/md/level" 2>/dev/null || echo "raid"))"
     elif [[ "$is_root" == "true" ]]; then
         local model=$(trim "$(cat "$path/device/model" 2>/dev/null || echo "")")
         [[ -n "$model" ]] && details="($model)"
@@ -221,10 +225,15 @@ render_block() {
 
     local mnt_raw=$(trim "${MOUNTS[$dev]:-}")
     local mnts=($mnt_raw)
+    
     local children=()
     if [[ "$is_root" == "true" ]]; then
         for p_path in "$path"/*; do
             [[ -f "$p_path/partition" ]] && children+=("${p_path##*/}")
+        done
+        # Also check if disk itself is a holder (rare but possible for raid on disks)
+        for h_path in "$path/holders"/*; do
+            [[ -d "$h_path" ]] && children+=("${h_path##*/}")
         done
     else
         for h_path in "$path/holders"/*; do
@@ -232,30 +241,24 @@ render_block() {
         done
     fi
 
-    # Print device line
-    STR_STORAGE+="${indent}${char} ${display_name}: [yellow]$(format_size "$sectors")[/yellow] ${details}"$'\n'
+    STR_STORAGE+="${indent}${prefix}${display_name}: [yellow]$(format_size "$sectors")[/yellow] ${details}"$'\n'
 
-    # Children indentation
     local next_indent="${indent}│  "
     [[ "$is_last" == "true" || "$is_root" == "true" ]] && next_indent="${indent}   "
-    [[ "$is_root" == "true" ]] && next_indent="  "
+    [[ "$is_root" == "true" ]] && next_indent="${indent}"
 
     local m_count=${#mnts[@]}
     local h_count=${#children[@]}
     local total=$((m_count + h_count))
 
-    # Render Mounts
     for ((i=0; i<m_count; i++)); do
-        local m_char="├─"
-        [[ $((i + 1)) -eq $total ]] && m_char="└─"
-        STR_STORAGE+="${next_indent}${m_char} [cyan]${mnts[$i]}[/cyan]"$'\n'
+        local m_char="├─ "; [[ $((i + 1)) -eq $total ]] && m_char="└─ "
+        STR_STORAGE+="${next_indent}${m_char}[cyan]${mnts[$i]}[/cyan]"$'\n'
     done
 
-    # Render Holders
     for ((i=0; i<h_count; i++)); do
-        local last="false"
-        [[ $((i + m_count + 1)) -eq $total ]] && last="true"
-        render_block "${children[$i]}" "$next_indent" "$last" "false"
+        local last="false"; [[ $((i + m_count + 1)) -eq $total ]] && last="true"
+        render_block "${children[$i]}" "$next_indent" "$last" "false" "$current_stack"
     done
 }
 
@@ -272,8 +275,23 @@ if [[ -f /proc/mdstat ]]; then
         [[ "$line" =~ ^md[0-9] ]] || continue
         dev="${line%% :*}"
         status="${line#* : }"
+        
+        # Colorize status
+        s_color="yellow"
+        [[ "$status" == *"active"* || "$status" == *"clean"* ]] && s_color="green"
+        [[ "$status" == *"degraded"* || "$status" == *"FAILED"* ]] && s_color="red"
+        
         sectors=$(cat "/sys/class/block/$dev/size" 2>/dev/null || echo 0)
-        STR_RAID+="  - /dev/$dev: [yellow]$(format_size "$sectors")[/yellow] ($status)"$'\n'
+        STR_RAID+="- /dev/$dev: [yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status[/$s_color])"$'\n'
+        
+        # Add RAID members as sub-tree
+        local slaves=(/sys/class/block/$dev/slaves/*)
+        local s_count=${#slaves[@]}
+        for ((i=0; i<s_count; i++)); do
+            s_char="├─ "; [[ $((i+1)) -eq $s_count ]] && s_char="└─ "
+            s_name="${slaves[$i]##*/}"
+            STR_RAID+="  ${s_char}${s_name}"$'\n'
+        done
     done < /proc/mdstat
 fi
 
