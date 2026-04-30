@@ -167,103 +167,96 @@ if [[ -f /proc/mounts ]]; then
     done < /proc/mounts
 fi
 
-# --- 2. Storage Tree ---
+# --- 2. Storage Tree Core ---
 log_step "Storage Tree"
 declare -A PROCESSED_DEVS
 
 format_size() {
-    local sectors="$1"
-    local size_gb=$(( sectors * 512 / 1073741824 ))
+    local sectors="$1"; local size_gb=$(( sectors * 512 / 1073741824 ))
     [[ $size_gb -eq 0 ]] && { echo "$(( sectors * 512 / 1048576 )) MB"; return; }
     echo "$size_gb GB"
 }
 
 get_dm_type() {
-    local dev="$1"
-    local uuid=$(cat "/sys/class/block/$dev/dm/uuid" 2>/dev/null || echo "")
-    [[ "$uuid" == LVM-* ]] && echo "lvm" && return
-    [[ "$uuid" == CRYPT-* ]] && echo "crypt" && return
-    echo "dm"
+    local dev="$1"; local uuid=$(cat "/sys/class/block/$dev/dm/uuid" 2>/dev/null || echo "")
+    [[ "$uuid" == LVM-* ]] && echo "lvm" && return; [[ "$uuid" == CRYPT-* ]] && echo "crypt" && return; echo "dm"
 }
 
 render_block() {
-    local dev="$1"
-    local indent="$2"
-    local is_last="$3"
-    local is_root="${4:-false}"
-    local call_stack="${5:-}"
+    local dev="$1" indent="$2" is_last="$3" is_root="${4:-false}" is_first="${5:-false}" stack="${6:-}"
+    if [[ "$dev" != md* ]]; then [[ -n "${PROCESSED_DEVS[$dev]:-}" ]] && return; PROCESSED_DEVS["$dev"]=1
+    else [[ "$stack" == *" $dev "* ]] && return; fi
+    local current_stack="$stack $dev "
 
-    # Global cache except for RAID (RAID should be shown under every member)
-    if [[ "$dev" != md* ]]; then
-        [[ -n "${PROCESSED_DEVS[$dev]:-}" ]] && return
-        PROCESSED_DEVS["$dev"]=1
-    else
-        # Still prevent infinite loops in RAID branch
-        [[ "$call_stack" == *" $dev "* ]] && return
-    fi
-    local current_stack="$call_stack $dev "
-
-    local path="/sys/class/block/$dev"
-    [[ -d "$path" ]] || return
-    
+    local path="/sys/class/block/$dev"; [[ -d "$path" ]] || return
     local sectors=$(cat "$path/size" 2>/dev/null || echo 0)
     [[ $sectors -eq 0 && "$is_root" == "false" ]] && return
     
-    local prefix="├─ "; [[ "$is_last" == "true" ]] && prefix="└─ "
-    [[ "$is_root" == "true" ]] && prefix=""
-
-    local display_name="/dev/$dev"
-    local details=""
-    if [[ -f "$path/dm/name" ]]; then
-        display_name="/dev/mapper/$(cat "$path/dm/name")"
-        details="($dev, $(get_dm_type "$dev"))"
-    elif [[ -f "$path/md/level" ]]; then
-        details="($dev, $(cat "$path/md/level" 2>/dev/null || echo "raid"))"
-    elif [[ "$is_root" == "true" ]]; then
-        local model=$(trim "$(cat "$path/device/model" 2>/dev/null || echo "")")
-        [[ -n "$model" ]] && details="($model)"
-    fi
-
-    set -f; local mnts=( ${MOUNTS[$dev]:-} ); set +f # Fast split, no trim
-    
+    # Discovery
+    set -f; local mnts=( ${MOUNTS[$dev]:-} ); set +f
     local children=()
-    if [[ "$is_root" == "true" ]]; then
-        # Specific glob for partitions to speed up
-        for p_path in "$path"/${dev}*; do
-            [[ -f "$p_path/partition" ]] && children+=("${p_path##*/}")
-        done
-    fi
-    # Always check holders
+    # ONLY logical holders (LVM, LUKS) are children. Partitions are siblings.
     for h_path in "$path/holders"/*; do
-        [[ -d "$h_path" ]] && children+=("${h_path##*/}")
+        [[ -d "$h_path" ]] || continue
+        local hn="${h_path##*/}"
+        # Skip partitions to keep hierarchy flat for disks
+        [[ -f "/sys/class/block/$hn/partition" ]] && continue
+        children+=("$hn")
     done
+    
+    local m_count=${#mnts[@]}; local h_count=${#children[@]}; local total=$((m_count + h_count))
+    local has_children=false; [[ $total -gt 0 ]] && has_children=true
+
+    # Symbols (2-character step geometry)
+    local c1="├"; [[ "$is_last" == "true" ]] && c1="└"; [[ "$is_first" == "true" ]] && c1="┌"
+    local c23="───"; [[ "$has_children" == "true" ]] && c23="─┬─"
+    local prefix="${c1}${c23} "
+
+    local display_name="/dev/$dev"; local details=""
+    if [[ -f "$path/dm/name" ]]; then
+        display_name="/dev/mapper/$(cat "$path/dm/name")"; details="($dev, $(get_dm_type "$dev"))"
+    elif [[ -f "$path/md/level" ]]; then details="($dev, $(cat "$path/md/level" 2>/dev/null || echo "raid"))"
+    elif [[ -f "$path/device/model" ]]; then
+        local model=$(trim "$(cat "$path/device/model" 2>/dev/null || echo "")")
+        [[ -n "$model" ]] && [[ ! "$dev" =~ [0-9]$ ]] && details="($model)"
+    fi
 
     STR_STORAGE+="${indent}${prefix}${display_name}: [yellow]$(format_size "$sectors")[/yellow] ${details}"$'\n'
 
-    local next_indent="${indent}│  "
-    [[ "$is_last" == "true" || "$is_root" == "true" ]] && next_indent="${indent}   "
-    [[ "$is_root" == "true" ]] && next_indent="${indent}"
-
-    local m_count=${#mnts[@]}
-    local h_count=${#children[@]}
-    local total=$((m_count + h_count))
-
+    # next_indent adds exactly 2 chars: symbol + space
+    local next_indent="${indent}│ "; [[ "$is_last" == "true" ]] && next_indent="${indent}  "
+    
+    # Render mounts
     for ((i=0; i<m_count; i++)); do
-        local m_char="├─ "; [[ $((i + 1)) -eq $total ]] && m_char="└─ "
-        STR_STORAGE+="${next_indent}${m_char}[cyan]${mnts[$i]}[/cyan]"$'\n'
+        local m_last=false; [[ $((i + 1)) -eq $total ]] && m_last=true
+        local m_c1="├"; [[ "$m_last" == "true" ]] && m_c1="└"
+        STR_STORAGE+="${next_indent}${m_c1}── [cyan]${mnts[$i]}[/cyan]"$'\n'
     done
-
+    # Render sub-devices (LVM/LUKS)
     for ((i=0; i<h_count; i++)); do
-        local last="false"; [[ $((i + m_count + 1)) -eq $total ]] && last="true"
-        render_block "${children[$i]}" "$next_indent" "$last" "false" "$current_stack"
+        local h_last=false; [[ $((i + m_count + 1)) -eq $total ]] && h_last=true
+        render_block "${children[$i]}" "$next_indent" "$h_last" "false" "false" "$current_stack"
     done
 }
 
-for dev_path in /sys/class/block/*; do
-    devname="${dev_path##*/}"
-    [[ "$devname" =~ ^(loop|ram|sr|nbd|md|dm-|zram) ]] && continue
-    [[ -f "$dev_path/partition" ]] && continue
-    render_block "$devname" "  " "true" "true"
+# Collect all top-level nodes: Disks and their Partitions as siblings
+ROOT_NODES=()
+for d_path in /sys/class/block/*; do
+    dn="${d_path##*/}"; [[ "$dn" =~ ^(loop|ram|sr|nbd|md|dm-|zram) ]] && continue
+    [[ -f "$d_path/partition" ]] && continue
+    ROOT_NODES+=("$dn")
+    # Add partitions immediately as siblings
+    for p_path in "$d_path"/${dn}*; do
+        [[ -f "$p_path/partition" ]] && ROOT_NODES+=("${p_path##*/}")
+    done
+done
+
+# Render the flattened root list
+RN_COUNT=${#ROOT_NODES[@]}
+for ((i=0; i<RN_COUNT; i++)); do
+    is_f=false; [[ $i -eq 0 ]] && is_f=true
+    is_l=false; [[ $((i+1)) -eq $RN_COUNT ]] && is_l=true
+    render_block "${ROOT_NODES[$i]}" "" "$is_l" "true" "$is_f"
 done
 
 log_step "RAID & Network"
