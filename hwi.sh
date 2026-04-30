@@ -276,8 +276,8 @@ if [[ -f /proc/mdstat ]]; then
         
         sectors=$(cat "/sys/class/block/$dev/size" 2>/dev/null || echo 0)
         STR_RAID+="- /dev/$dev: [yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status[/$s_color])"$'\n'
-        local slaves=(/sys/class/block/$dev/slaves/*)
-        local s_count=${#slaves[@]}
+        slaves=(/sys/class/block/$dev/slaves/*)
+        s_count=${#slaves[@]}
         for ((i=0; i<s_count; i++)); do
             s_char="├─ "; [[ $((i+1)) -eq $s_count ]] && s_char="└─ "
             STR_RAID+="  ${s_char}${slaves[$i]##*/}"$'\n'
