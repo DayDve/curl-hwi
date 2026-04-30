@@ -144,152 +144,116 @@ while read -r key val _; do
     esac
 done < /proc/meminfo
 
-# --- 2. Preparing Lists and Sections ---
+# --- 2. Advanced Storage Tree (lsblk style) ---
+declare -A MOUNTS
+while read -r dev mnt _; do
+    [[ "$dev" == /dev/* ]] || continue
+    # Resolve names like /dev/sda1 or /dev/mapper/xxx
+    real_dev="$dev"
+    [[ -L "$dev" ]] && real_dev=$(readlink -f "$dev")
+    node="${real_dev##*/}"
+    MOUNTS["$node"]+="${mnt} "
+done < /proc/mounts
 
-# Basic Info Extensions
-STR_VIRT=""
-[[ "$VIRT" != "none" ]] && STR_VIRT="[bold][blue][Virt]:[/blue][/bold]    $VIRT"$'\n'
+format_size() {
+    local sectors="$1"
+    local size_gb=$(( sectors * 512 / 1073741824 ))
+    if [[ $size_gb -eq 0 ]]; then
+        echo "$(( sectors * 512 / 1048576 )) MB"
+    else
+        echo "$size_gb GB"
+    fi
+}
 
-# System info
-STR_SYS=""
-if [[ -r /sys/class/dmi/id/sys_vendor ]]; then
-    v=$(trim "$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo "Unknown")")
-    p=$(trim "$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "Unknown")")
-    STR_SYS+="[bold][blue][System]:[/blue][/bold]  ${v} ${p}"$'\n'
+get_dm_type() {
+    local dev="$1"
+    local uuid=$(cat "/sys/class/block/$dev/dm/uuid" 2>/dev/null || echo "")
+    [[ "$uuid" == LVM-* ]] && echo "lvm" && return
+    [[ "$uuid" == CRYPT-* ]] && echo "crypt" && return
+    echo "dm"
+}
+
+render_block() {
+    local dev="$1"
+    local indent="$2"
+    local is_last="$3"
+    local is_root="${4:-false}"
     
-    bv=$(trim "$(cat /sys/class/dmi/id/board_vendor 2>/dev/null || echo "Unknown")")
-    bn=$(trim "$(cat /sys/class/dmi/id/board_name 2>/dev/null || echo "")")
-    [[ -n "$bn" && "$bn" != "$p" ]] && STR_SYS+="[bold][blue][MB]:[/blue][/bold]      ${bv} ${bn}"$'\n'
+    local path="/sys/class/block/$dev"
+    [[ -d "$path" ]] || return
+    
+    local sectors=$(cat "$path/size" 2>/dev/null || echo 0)
+    [[ $sectors -eq 0 && "$is_root" == "false" ]] && return
+    
+    local char="├─"
+    [[ "$is_last" == "true" ]] && char="└─"
+    [[ "$is_root" == "true" ]] && char="-"
 
-    bios_v=$(trim "$(cat /sys/class/dmi/id/bios_version 2>/dev/null || echo "")")
-    bios_d=$(trim "$(cat /sys/class/dmi/id/bios_date 2>/dev/null || echo "")")
-    [[ -n "$bios_v" ]] && STR_SYS+="[bold][blue][BIOS]:[/blue][/bold]    ${bios_v} (${bios_d})"$'\n'
-fi
-
-# Battery
-STR_BATTERY=""
-for bat in /sys/class/power_supply/BAT*; do
-    if [[ -d "$bat" ]]; then
-        cap=$(cat "$bat/capacity" 2>/dev/null || echo "")
-        stat=$(cat "$bat/status" 2>/dev/null || echo "Unknown")
-        [[ -n "$cap" ]] && STR_BATTERY+="[bold][blue][Battery]:[/blue][/bold] ${cap}% (${stat})"$'\n'
+    # Display name and details
+    local display_name="/dev/$dev"
+    local details=""
+    if [[ -f "$path/dm/name" ]]; then
+        display_name="/dev/mapper/$(cat "$path/dm/name")"
+        details="($dev, $(get_dm_type "$dev"))"
+    elif [[ "$is_root" == "true" ]]; then
+        local model=$(trim "$(cat "$path/device/model" 2>/dev/null || echo "")")
+        [[ -n "$model" ]] && details="($model)"
     fi
-done
 
-# RAM & ZRAM
-RAM_STR="Total: $((tot / 1024)) GB, Available: $((avl / 1024)) GB"
-if command -v dmidecode >/dev/null; then
-    dmi=$(dmidecode -t 17 2>/dev/null || echo "")
-    if [[ -n "$dmi" ]]; then
-        slots=$(grep -c "Memory Device" <<< "$dmi" || true)
-        sticks=$(grep -c "Size: [0-9]" <<< "$dmi" || true)
-        type=$(grep -m1 "Type:" <<< "$dmi" | cut -d: -f2 | tr -d ' ' || echo "")
-        speed=$(grep -m1 "Speed:" <<< "$dmi" | cut -d: -f2 | tr -d ' ' || echo "")
-        [[ -n "$type" && "$type" != "Unknown" ]] && RAM_STR+=" ($type"
-        [[ -n "$speed" && "$speed" != "Unknown" ]] && RAM_STR+=", $speed"
-        [[ $slots -gt 0 ]] && RAM_STR+=", Slots: $sticks/$slots"
-        [[ "$RAM_STR" == *"("* ]] && RAM_STR+=")"
+    # Mountpoints
+    local mnt_raw=$(trim "${MOUNTS[$dev]:-}")
+    local mnt_str=""
+    [[ -n "$mnt_raw" ]] && mnt_str=" -> [cyan]${mnt_raw// /, }[/cyan]"
+
+    STR_STORAGE+="${indent}${char} ${display_name}: [yellow]$(format_size "$sectors")[/yellow] ${details}${mnt_str}"$'\n'
+
+    # Children
+    local children=()
+    if [[ "$is_root" == "true" ]]; then
+        # For disk, find partitions
+        for p_path in "$path"/*; do
+            [[ -f "$p_path/partition" ]] && children+=("${p_path##*/}")
+        done
+    else
+        # For partition/logical, find holders
+        for h_path in "$path/holders"/*; do
+            [[ -d "$h_path" ]] && children+=("${h_path##*/}")
+        done
     fi
-fi
-if [[ -f /sys/block/zram0/disksize ]]; then
-    zsize=$(cat /sys/block/zram0/disksize 2>/dev/null || echo 0)
-    [[ $zsize -gt 0 ]] && RAM_STR+=", Zram: $((zsize / 1024 / 1024 / 1024)) GB"
-fi
-[[ $swp_t -gt 0 ]] && RAM_STR+=", Swap: $(( (swp_t - swp_f) / 1024 ))/$((swp_t / 1024)) GB"
 
-# Physical Storage
+    # Formatting for next level
+    local next_indent="${indent}│  "
+    [[ "$is_last" == "true" || "$is_root" == "true" ]] && next_indent="${indent}   "
+    [[ "$is_root" == "true" ]] && next_indent="  "
+
+    local count=${#children[@]}
+    for ((i=0; i<count; i++)); do
+        local last="false"
+        [[ $i -eq $((count-1)) ]] && last="true"
+        render_block "${children[$i]}" "$next_indent" "$last" "false"
+    done
+}
+
 STR_STORAGE=""
 for dev_path in /sys/class/block/*; do
     devname="${dev_path##*/}"
+    # Start with physical disks only
     [[ "$devname" =~ ^(loop|ram|sr|nbd|md|dm-|zram) ]] && continue
     [[ -f "$dev_path/partition" ]] && continue
-    sectors=$(cat "$dev_path/size" 2>/dev/null || continue)
-    size_gb=$(( sectors * 512 / 1073741824 ))
-    [[ $size_gb -eq 0 ]] && continue
-    model=$(trim "$(cat "$dev_path/device/model" 2>/dev/null || echo "")")
-    [[ -z "$model" ]] && model="N/A"
-    STR_STORAGE+="  - /dev/$devname: [yellow]$size_gb GB[/yellow] ($model)"$'\n'
+    render_block "$devname" "  " "true" "true"
 done
 
-# Logical Volumes, RAID & Btrfs (Tree view)
-STR_LOGICAL=""
-# MD RAID
+# RAID Status (only if RAID exists)
+STR_RAID=""
 if [[ -f /proc/mdstat ]]; then
     while read -r line; do
-        [[ "$line" =~ ^md ]] || continue
+        [[ "$line" =~ ^md[0-9] ]] || continue
         dev="${line%% :*}"
         status="${line#* : }"
-        size_str=""
-        if [[ -f "/sys/class/block/$dev/size" ]]; then
-            s=$(cat "/sys/class/block/$dev/size")
-            size_str="[yellow]$(( s * 512 / 1073741824 )) GB[/yellow] "
-        fi
-        STR_LOGICAL+="  - /dev/$dev: ${size_str}($status)"$'\n'
-        # Slaves
-        if [[ -d "/sys/class/block/$dev/slaves" ]]; then
-            slaves=( /sys/class/block/"$dev"/slaves/* )
-            for ((i=0; i<${#slaves[@]}; i++)); do
-                [[ -e "${slaves[$i]}" ]] || continue
-                sdev="${slaves[$i]##*/}"
-                char="├─"
-                [[ $i -eq $((${#slaves[@]}-1)) ]] && char="└─"
-                STR_LOGICAL+="    $char $sdev"$'\n'
-            done
-        fi
+        sectors=$(cat "/sys/class/block/$dev/size" 2>/dev/null || echo 0)
+        STR_RAID+="  - /dev/$dev: [yellow]$(format_size "$sectors")[/yellow] ($status)"$'\n'
     done < /proc/mdstat
 fi
-# LVM / Device Mapper
-for dm_path in /sys/class/block/dm-*; do
-    [[ -d "$dm_path/dm" ]] || continue
-    dm_name=$(cat "$dm_path/dm/name" 2>/dev/null || echo "")
-    [[ -z "$dm_name" ]] && continue
-    sectors=$(cat "$dm_path/size" 2>/dev/null || continue)
-    size_gb=$(( sectors * 512 / 1073741824 ))
-    [[ $size_gb -eq 0 ]] && continue
-    STR_LOGICAL+="  - /dev/mapper/$dm_name: [yellow]$size_gb GB[/yellow] (LVM/DM)"$'\n'
-    # Slaves
-    if [[ -d "$dm_path/slaves" ]]; then
-        slaves=( "$dm_path/slaves"/* )
-        for ((i=0; i<${#slaves[@]}; i++)); do
-            [[ -e "${slaves[$i]}" ]] || continue
-            sdev="${slaves[$i]##*/}"
-            [[ "$sdev" == dm-* ]] && sdev="mapper/$(cat "/sys/class/block/$sdev/dm/name" 2>/dev/null || echo "$sdev")"
-            char="├─"
-            [[ $i -eq $((${#slaves[@]}-1)) ]] && char="└─"
-            STR_LOGICAL+="    $char $sdev"$'\n'
-        done
-    fi
-done
-# Btrfs Pools
-if [[ -d /sys/fs/btrfs ]]; then
-    for fs_path in /sys/fs/btrfs/*; do
-        [[ -f "$fs_path/label" ]] || continue
-        label=$(cat "$fs_path/label" 2>/dev/null || echo "N/A")
-        profile="single"
-        for p in raid0 raid1 raid10 raid5 raid6 dup; do
-            [[ -d "$fs_path/allocation/data/$p" ]] && { profile="$p"; break; }
-        done
-        STR_LOGICAL+="  - Btrfs Pool: Label: [cyan]${label}[/cyan], Profile: [yellow]${profile}[/yellow]"$'\n'
-        # Devices
-        if [[ -d "$fs_path/devices" ]]; then
-            devs=( "$fs_path/devices"/* )
-            for ((i=0; i<${#devs[@]}; i++)); do
-                [[ -e "${devs[$i]}" ]] || continue
-                sdev="${devs[$i]##*/}"
-                char="├─"
-                [[ $i -eq $((${#devs[@]}-1)) ]] && char="└─"
-                STR_LOGICAL+="    $char $sdev"$'\n'
-            done
-        fi
-    done
-fi
-
-# Partitions
-STR_FS=""
-while read -r fs type size used avail pcent mount; do
-    [[ "$fs" != /dev/* ]] && continue
-    STR_FS+="  - [cyan]$mount[/cyan]: [yellow]$size[/yellow] ($type, $pcent used) on [cyan]$fs[/cyan]"$'\n'
-done < <(df -hT 2>/dev/null || true)
 
 # Network
 STR_NET=""
@@ -402,9 +366,8 @@ REPORT+="${STR_BATTERY}"
 REPORT+="[bold][blue][CPU]:[/blue][/bold]     $CPU_MODEL ($CPU_CORES cores) @ [yellow]$TEMP[/yellow]"$'\n'
 REPORT+="[bold][blue][RAM]:[/blue][/bold]     $RAM_STR"$'\n'
 REPORT+="${STR_GPU}"
-REPORT+="[bold][blue][Physical Storage]:[/blue][/bold]"$'\n'"$STR_STORAGE"
-[[ -n "$STR_LOGICAL" ]] && REPORT+="[bold][blue][Logical Volumes & RAID]:[/blue][/bold]"$'\n'"$STR_LOGICAL"
-REPORT+="[bold][blue][Partitions & FS]:[/blue][/bold]"$'\n'"$STR_FS"
+REPORT+="[bold][blue][Storage Tree]:[/blue][/bold]"$'\n'"$STR_STORAGE"
+[[ -n "$STR_RAID" ]] && REPORT+="[bold][blue][RAID Status]:[/blue][/bold]"$'\n'"$STR_RAID"
 REPORT+="[bold][blue][Network]:[/blue][/bold]"$'\n'"$STR_NET"
 REPORT+="${STR_EXT}"
 
