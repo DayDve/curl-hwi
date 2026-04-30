@@ -262,18 +262,26 @@ done
 log_step "RAID & Network"
 if [[ -f /proc/mdstat ]]; then
     while read -r line; do
-        [[ "$line" =~ ^md[0-9] ]] || continue
-        dev="${line%% :*}"; status="${line#* : }"
-        s_color="yellow"; [[ "$status" == *"active"* || "$status" == *"clean"* ]] && s_color="green"
-        [[ "$status" == *"degraded"* || "$status" == *"FAILED"* ]] && s_color="red"
+        [[ "$line" =~ ^md[0-9]+ ]] || continue
+        dev="${line%% :*}"; 
+        
+        # Parse status and slaves with indices
+        rest="${line#* : }"
+        status_part="${rest%% [a-z0-9]*}"
+        slaves_part="${rest#$status_part }"
+        
+        s_color="yellow"; [[ "$status_part" == *"active"* ]] && s_color="green"
+        [[ "$status_part" == *"degraded"* || "$status_part" == *"FAILED"* ]] && s_color="red"
         
         sectors=$(cat "/sys/class/block/$dev/size" 2>/dev/null || echo 0)
-        STR_RAID+="- /dev/$dev: [yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status[/$s_color])"$'\n'
-        slaves=(/sys/class/block/$dev/slaves/*)
-        s_count=${#slaves[@]}
+        STR_RAID+="- /dev/$dev: [yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status_part[/$s_color])"$'\n'
+        
+        # Parse individual slaves like sda1[0]
+        read -ra slaves_arr <<< "$slaves_part"
+        s_count=${#slaves_arr[@]}
         for ((i=0; i<s_count; i++)); do
             s_char="├─ "; [[ $((i+1)) -eq $s_count ]] && s_char="└─ "
-            STR_RAID+="  ${s_char}${slaves[$i]##*/}"$'\n'
+            STR_RAID+="  ${s_char}${slaves_arr[$i]}"$'\n'
         done
     done < /proc/mdstat
 fi
