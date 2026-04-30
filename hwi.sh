@@ -114,7 +114,7 @@ if [[ -f /sys/class/dmi/id/sys_vendor ]]; then
         *microsoft*) VIRT="hyper-v" ;;
     esac
 fi
-[[ "$VIRT" != "none" ]] && STR_VIRT="[bold][blue][Virt]:[/blue][/bold]    $VIRT"$'\n'
+[[ "$VIRT" != "none" ]] && STR_VIRT="[bold][blue][Virt]:[/blue][/bold]      $VIRT"$'\n'
 
 log_step "Uptime & CPU"
 read -r up_sec _ < /proc/uptime || up_sec=0
@@ -182,12 +182,24 @@ get_dm_type() {
     [[ "$uuid" == LVM-* ]] && echo "lvm" && return; [[ "$uuid" == CRYPT-* ]] && echo "crypt" && return; echo "dm"
 }
 
-render_block() {
-    local dev="$1" indent="$2" is_last="$3" is_root="${4:-false}" is_first="${5:-false}" stack="${6:-}"
-    if [[ "$dev" != md* ]]; then [[ -n "${PROCESSED_DEVS[$dev]:-}" ]] && return; PROCESSED_DEVS["$dev"]=1
-    else [[ "$stack" == *" $dev "* ]] && return; fi
-    local current_stack="$stack $dev "
+# --- Tree Rendering Helpers ---
+draw_tree_item() {
+    local indent="$1" is_f="$2" is_l="$3" has_c="$4" content="$5"
+    local c1="├"; [[ "$is_l" == "true" ]] && c1="└"; [[ "$is_f" == "true" ]] && c1="┌"
+    local c23="───"; [[ "$has_c" == "true" ]] && c23="─┬─"
+    echo -e "${indent}${c1}${c23} ${content}"
+}
 
+get_next_indent() {
+    local indent="$1" is_l="$2"
+    if [[ "$is_l" == "true" ]]; then echo "${indent}  "; else echo "${indent}│ "; fi
+}
+
+declare -A PROCESSED_DEVS
+render_block() {
+    local dev="$1" indent="$2" is_l="$3" is_root="$4" is_f="$5"
+    [[ -n "${PROCESSED_DEVS[$dev]:-}" ]] && return; PROCESSED_DEVS["$dev"]=1
+    
     local path="/sys/class/block/$dev"; [[ -d "$path" ]] || return
     local sectors=$(cat "$path/size" 2>/dev/null || echo 0)
     [[ $sectors -eq 0 && "$is_root" == "false" ]] && return
@@ -195,22 +207,15 @@ render_block() {
     # Discovery
     set -f; local mnts=( ${MOUNTS[$dev]:-} ); set +f
     local children=()
-    # ONLY logical holders (LVM, LUKS) are children. Partitions are siblings.
     for h_path in "$path/holders"/*; do
         [[ -d "$h_path" ]] || continue
         local hn="${h_path##*/}"
-        # Skip partitions to keep hierarchy flat for disks
         [[ -f "/sys/class/block/$hn/partition" ]] && continue
         children+=("$hn")
     done
     
     local m_count=${#mnts[@]}; local h_count=${#children[@]}; local total=$((m_count + h_count))
-    local has_children=false; [[ $total -gt 0 ]] && has_children=true
-
-    # Symbols (2-character step geometry)
-    local c1="├"; [[ "$is_last" == "true" ]] && c1="└"; [[ "$is_first" == "true" ]] && c1="┌"
-    local c23="───"; [[ "$has_children" == "true" ]] && c23="─┬─"
-    local prefix="${c1}${c23} "
+    local has_c=false; [[ $total -gt 0 ]] && has_c=true
 
     local display_name="/dev/$dev"; local details=""
     if [[ -f "$path/dm/name" ]]; then
@@ -221,37 +226,28 @@ render_block() {
         [[ -n "$model" ]] && [[ ! "$dev" =~ [0-9]$ ]] && details="($model)"
     fi
 
-    STR_STORAGE+="${indent}${prefix}${display_name}: [yellow]$(format_size "$sectors")[/yellow] ${details}"$'\n'
+    STR_STORAGE+="$(draw_tree_item "$indent" "$is_f" "$is_l" "$has_c" "${display_name}: [yellow]$(format_size "$sectors")[/yellow] ${details}")"$'\n'
 
-    # next_indent adds exactly 2 chars: symbol + space
-    local next_indent="${indent}│ "; [[ "$is_last" == "true" ]] && next_indent="${indent}  "
-    
-    # Render mounts
+    local n_indent=$(get_next_indent "$indent" "$is_l")
     for ((i=0; i<m_count; i++)); do
-        local m_last=false; [[ $((i + 1)) -eq $total ]] && m_last=true
-        local m_c1="├"; [[ "$m_last" == "true" ]] && m_c1="└"
-        STR_STORAGE+="${next_indent}${m_c1}── [cyan]${mnts[$i]}[/cyan]"$'\n'
+        local last=false; [[ $((i + 1)) -eq $total ]] && last=true
+        STR_STORAGE+="$(draw_tree_item "$n_indent" "false" "$last" "false" "[cyan]${mnts[$i]}[/cyan]")"$'\n'
     done
-    # Render sub-devices (LVM/LUKS)
     for ((i=0; i<h_count; i++)); do
-        local h_last=false; [[ $((i + m_count + 1)) -eq $total ]] && h_last=true
-        render_block "${children[$i]}" "$next_indent" "$h_last" "false" "false" "$current_stack"
+        local last=false; [[ $((i + m_count + 1)) -eq $total ]] && last=true
+        render_block "${children[$i]}" "$n_indent" "$last" "false" "false"
     done
 }
 
-# Collect all top-level nodes: Disks and their Partitions as siblings
+# Flattened root collection: Disks and Partitions as siblings
 ROOT_NODES=()
 for d_path in /sys/class/block/*; do
     dn="${d_path##*/}"; [[ "$dn" =~ ^(loop|ram|sr|nbd|md|dm-|zram) ]] && continue
     [[ -f "$d_path/partition" ]] && continue
     ROOT_NODES+=("$dn")
-    # Add partitions immediately as siblings
-    for p_path in "$d_path"/${dn}*; do
-        [[ -f "$p_path/partition" ]] && ROOT_NODES+=("${p_path##*/}")
-    done
+    for p_path in "$d_path"/${dn}*; do [[ -f "$p_path/partition" ]] && ROOT_NODES+=("${p_path##*/}"); done
 done
 
-# Render the flattened root list
 RN_COUNT=${#ROOT_NODES[@]}
 for ((i=0; i<RN_COUNT; i++)); do
     is_f=false; [[ $i -eq 0 ]] && is_f=true
@@ -263,25 +259,19 @@ log_step "RAID & Network"
 if [[ -f /proc/mdstat ]]; then
     while read -r line; do
         [[ "$line" =~ ^md[0-9]+ ]] || continue
-        dev="${line%% :*}"; 
+        md_dev="${line%% :*}"; 
+        rest="${line#* : }"; status_word="${rest%% *}"
+        l_s="${rest#$status_word }"; raid_level="${l_s%% *}"; slaves_part="${l_s#$raid_level }"
         
-        # Parse status and slaves with indices
-        rest="${line#* : }"
-        status_part="${rest%% [a-z0-9]*}"
-        slaves_part="${rest#$status_part }"
+        s_color="yellow"; [[ "$status_word" == *"active"* ]] && s_color="green"
+        sectors=$(cat "/sys/class/block/$md_dev/size" 2>/dev/null || echo 0)
+        STR_RAID+="- /dev/$md_dev: [yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status_word $raid_level[/$s_color])"$'\n'
         
-        s_color="yellow"; [[ "$status_part" == *"active"* ]] && s_color="green"
-        [[ "$status_part" == *"degraded"* || "$status_part" == *"FAILED"* ]] && s_color="red"
-        
-        sectors=$(cat "/sys/class/block/$dev/size" 2>/dev/null || echo 0)
-        STR_RAID+="- /dev/$dev: [yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status_part[/$s_color])"$'\n'
-        
-        # Parse individual slaves like sda1[0]
         read -ra slaves_arr <<< "$slaves_part"
         s_count=${#slaves_arr[@]}
         for ((i=0; i<s_count; i++)); do
-            s_char="├─ "; [[ $((i+1)) -eq $s_count ]] && s_char="└─ "
-            STR_RAID+="  ${s_char}${slaves_arr[$i]}"$'\n'
+            s_l=false; [[ $((i+1)) -eq $s_count ]] && s_l=true
+            STR_RAID+="$(draw_tree_item "  " "false" "$s_l" "false" "${slaves_arr[$i]}")"$'\n'
         done
     done < /proc/mdstat
 fi
@@ -324,7 +314,7 @@ log_step "System DMI"
 if [[ -f /sys/class/dmi/id/sys_vendor ]]; then
     dmi_v=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || echo "Unknown")
     dmi_p=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "Unknown")
-    STR_SYS+="[bold][blue][System]:[/blue][/bold]  ${dmi_v} ${dmi_p}"$'\n'
+    STR_SYS+="[bold][blue][System]:[/blue][/bold]    ${dmi_v} ${dmi_p}"$'\n'
 fi
 
 # Logo
@@ -342,24 +332,23 @@ if $SHOW_LOGO; then
          ░█▀▀░█░█░█▀▀░▀█▀░█▀▀░█▄█░░░█▀▄░█▀▀░█▀█░█▀█░█▀▄░▀█▀░
          ░▀▀█░░█░░▀▀█░░█░░█▀▀░█░█░░░█▀▄░█▀▀░█▀▀░█░█░█▀▄░░█░░
          ░▀▀▀░░▀░░▀▀▀░░▀░░▀▀▀░▀░▀░░░▀░▀░▀▀▀░▀░░░▀▀▀░▀░▀░░▀░░
-                                                             
-         ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
-[/cyan][/bold]"$'\n'
+
+     ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀[/cyan][/bold]"$'\n'
 fi
 
 REPORT="${STR_LOGO}"
-REPORT+="[bold][blue][OS]:[/blue][/bold]      $OS_NAME ($ARCH)"$'\n'
-REPORT+="[bold][blue][Hostname]:[/blue][/bold] $HOSTNAME"$'\n'
-REPORT+="[bold][blue][Kernel]:[/blue][/bold]  $KERNEL"$'\n'
+REPORT+="[bold][blue][OS]:[/blue][/bold]        $OS_NAME ($ARCH)"$'\n'
+REPORT+="[bold][blue][Hostname]:[/blue][/bold]  $HOSTNAME"$'\n'
+REPORT+="[bold][blue][Kernel]:[/blue][/bold]    $KERNEL"$'\n'
 REPORT+="${STR_VIRT}"
-REPORT+="[bold][blue][Uptime]:[/blue][/bold]  $UPTIME (Load: $LOAD)"$'\n'
-REPORT+="[bold][blue][Context]:[/blue][/bold] $LOCAL_TIME (Procs: $PROCS, Entropy: $ENTROPY)"$'\n'
+REPORT+="[bold][blue][Uptime]:[/blue][/bold]    $UPTIME (Load: $LOAD)"$'\n'
+REPORT+="[bold][blue][Context]:[/blue][/bold]   $LOCAL_TIME (Procs: $PROCS, Entropy: $ENTROPY)"$'\n'
 REPORT+="${STR_SYS}"
-REPORT+="[bold][blue][CPU]:[/blue][/bold]     $CPU_MODEL ($CPU_CORES cores) @ [yellow]$TEMP[/yellow]"$'\n'
-REPORT+="[bold][blue][RAM]:[/blue][/bold]     $RAM_STR"$'\n'
+REPORT+="[bold][blue][CPU]:[/blue][/bold]       $CPU_MODEL ($CPU_CORES cores) @ [yellow]$TEMP[/yellow]"$'\n'
+REPORT+="[bold][blue][RAM]:[/blue][/bold]       $RAM_STR"$'\n'
 REPORT+="${STR_GPU}"
 REPORT+="[bold][blue][Storage Tree]:[/blue][/bold]"$'\n'"$STR_STORAGE"
-[[ -n "$STR_RAID" ]] && REPORT+="[bold][blue][RAID Status]:[/blue][/bold]"$'\n'"$STR_RAID"
+REPORT+="[bold][blue][RAID Status]:[/blue][/bold]"$'\n'"$STR_RAID"
 REPORT+="[bold][blue][Network]:[/blue][/bold]"$'\n'"$STR_NET"
 REPORT+="${STR_EXT}"
 
