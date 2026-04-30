@@ -195,25 +195,25 @@ get_dm_type() {
 }
 
 # --- Unified Tree Rendering Engine ---
-# render_tree_node name details stack c_idx t_sibs total_children is_root
-# Sets global TREE_LINE and TREE_STACK
+# render_tree_node name details stack c_idx t_sibs total_children is_root is_flat
 render_tree_node() {
-    local name="$1" details="$2" stack="$3" c_idx="$4" t_sibs="$5" total="$6" is_root="$7"
+    local name="$1" details="$2" stack="$3" c_idx="$4" t_sibs="$5" total="$6" is_root="$7" is_flat="${8:-false}"
     local prefix=""; local n_stack=""
-    local W=$((total + 1))
     
     if [[ "$is_root" == "true" ]]; then
+        local W=$((total + 1))
         prefix=" ┌"; for ((i=0; i<total-1; i++)); do prefix+="┬"; done
         while [[ ${#prefix} -lt $((W+1)) ]]; do prefix+="─"; done
         n_stack=" "
+    elif [[ "$is_flat" == "true" ]]; then
+        prefix="$stack"
+        if [[ $((c_idx + 1)) -lt $t_sibs ]]; then prefix+="├── "; n_stack="${stack}│   "; else prefix+="└── "; n_stack="${stack}    "; fi
     else
         prefix="$stack"
         for ((i=0; i<t_sibs-c_idx-1; i++)); do prefix+="│"; done
         n_stack="$prefix"
-        prefix+="└"
-        for ((i=0; i<c_idx; i++)); do prefix+="─"; done
+        prefix+="└"; for ((i=0; i<c_idx; i++)); do prefix+="─"; done
         if [[ $total -gt 0 ]]; then prefix+="┬"; else prefix+="─"; fi
-        # Child stack: vertical lines + (c_idx + 1) spaces to align with ┬
         for ((i=0; i<c_idx + 1; i++)); do n_stack+=" "; done
     fi
     
@@ -233,17 +233,18 @@ render_storage_tree() {
     
     local mnts=( ${MOUNTS[$dev]:-} ); local children=()
     if [[ "$is_root" == "true" ]]; then
-        for p_path in "$path"/${dev}*; do [[ -f "$p_path/partition" ]] && children+=("${p_path##*/}"); done
+        # Sorted partition discovery
+        while read -r p; do children+=("$p"); done < <(ls -1d "$path"/${dev}* 2>/dev/null | xargs -n1 basename | sort -V)
     fi
-    for h_path in "$path/holders"/*; do
-        [[ -d "$h_path" ]] || continue
-        local hn="${h_path##*/}"
-        local skip=false; for c in "${children[@]}"; do [[ "$c" == "$hn" ]] && skip=true && break; done
+    # Sorted holders discovery
+    while read -r h; do
+        [[ -d "$path/holders/$h" ]] || continue
+        local skip=false; for c in "${children[@]}"; do [[ "$c" == "$h" ]] && skip=true && break; done
         [[ "$skip" == "true" ]] && continue
-        children+=("$hn")
-    done
+        children+=("$h")
+    done < <(ls -1 "$path/holders" 2>/dev/null | sort -V)
     
-    local total=$(( ${#mnts[@]} + ${#children[@]} ))
+    local m_count=${#mnts[@]}; local c_count=${#children[@]}; local total=$((m_count + c_count))
     local display_name="/dev/$dev"; local details="[yellow]$(format_size "$sectors")[/yellow]"
     if [[ -f "$path/dm/name" ]]; then
         display_name="/dev/mapper/$(cat "$path/dm/name")"; details+=" ($dev, $(get_dm_type "$dev"))"
@@ -257,12 +258,14 @@ render_storage_tree() {
     STR_STORAGE+="$TREE_LINE"$'\n'
     local n_stack="$TREE_STACK"
 
-    for ((i=0; i<${#mnts[@]}; i++)); do
-        render_tree_node "[cyan]${mnts[$i]}[/cyan]" "" "$n_stack" "$i" "$total" 0 "false"
+    # Mount points use FLAT style to prevent vertical line explosion
+    for ((i=0; i<m_count; i++)); do
+        render_tree_node "[cyan]${mnts[$i]}[/cyan]" "" "$n_stack" "$i" "$total" 0 "false" "true"
         STR_STORAGE+="$TREE_LINE"$'\n'
     done
-    for ((i=0; i<${#children[@]}; i++)); do
-        render_storage_tree "${children[$i]}" "$n_stack" "$((i+${#mnts[@]}))" "$total" "false"
+    # Physical children use STACKED style as requested
+    for ((i=0; i<c_count; i++)); do
+        render_storage_tree "${children[$i]}" "$n_stack" "$((i+m_count))" "$total" "false"
     done
 }
 
@@ -272,6 +275,8 @@ for d_path in /sys/class/block/*; do
     [[ -f "$d_path/partition" ]] && continue
     ROOT_NODES+=("$dn")
 done
+# Sort root nodes too
+IFS=$'\n' ROOT_NODES=($(sort -V <<<"${ROOT_NODES[*]}")); unset IFS
 for ((i=0; i<${#ROOT_NODES[@]}; i++)); do render_storage_tree "${ROOT_NODES[$i]}" "" 0 0 "true"; done
 
 log_step "RAID Status"
@@ -287,9 +292,9 @@ if [[ -f /proc/mdstat ]]; then
         
         render_tree_node "/dev/$md_dev" "[yellow]$(format_size "$sectors")[/yellow] ([$s_color]$status_word $raid_level[/$s_color])" "" 0 0 "${#slaves_arr[@]}" "true"
         STR_RAID+="$TREE_LINE"$'\n'
-        local n_stack="$TREE_STACK"
+        md_stack="$TREE_STACK"
         for ((i=0; i<${#slaves_arr[@]}; i++)); do
-            render_tree_node "${slaves_arr[$i]}" "" "$n_stack" "$i" "${#slaves_arr[@]}" 0 "false"
+            render_tree_node "${slaves_arr[$i]}" "" "$md_stack" "$i" "${#slaves_arr[@]}" 0 "false"
             STR_RAID+="$TREE_LINE"$'\n'
         done
     done < /proc/mdstat
