@@ -216,69 +216,71 @@ STR_LOGICAL=""
 # MD RAID
 if [[ -f /proc/mdstat ]]; then
     while read -r line; do
-        [[ "$line" =~ ^md[0-9] ]] || continue
+        [[ "$line" =~ ^md ]] || continue
         dev="${line%% :*}"
         status="${line#* : }"
+        size_str=""
         if [[ -f "/sys/class/block/$dev/size" ]]; then
             s=$(cat "/sys/class/block/$dev/size")
-            STR_LOGICAL+="  - /dev/$dev: [yellow]$(( s * 512 / 1073741824 )) GB[/yellow] ($status)"$'\n'
-        else
-            STR_LOGICAL+="  - /dev/$dev: $status"$'\n'
+            size_str="[yellow]$(( s * 512 / 1073741824 )) GB[/yellow] "
         fi
-        # Slaves (Tree)
-        slaves=( /sys/class/block/"$dev"/slaves/* )
-        scount=${#slaves[@]}
-        for ((i=0; i<scount; i++)); do
-            [[ ! -e "${slaves[$i]}" ]] && continue
-            sdev="${slaves[$i]##*/}"
-            char="├─"
-            [[ $i -eq $((scount-1)) ]] && char="└─"
-            STR_LOGICAL+="    $char $sdev"$'\n'
-        done
+        STR_LOGICAL+="  - /dev/$dev: ${size_str}($status)"$'\n'
+        # Slaves
+        if [[ -d "/sys/class/block/$dev/slaves" ]]; then
+            slaves=( /sys/class/block/"$dev"/slaves/* )
+            for ((i=0; i<${#slaves[@]}; i++)); do
+                [[ -e "${slaves[$i]}" ]] || continue
+                sdev="${slaves[$i]##*/}"
+                char="├─"
+                [[ $i -eq $((${#slaves[@]}-1)) ]] && char="└─"
+                STR_LOGICAL+="    $char $sdev"$'\n'
+            done
+        fi
     done < /proc/mdstat
 fi
 # LVM / Device Mapper
 for dm_path in /sys/class/block/dm-*; do
     [[ -d "$dm_path/dm" ]] || continue
-    dm_name=$(cat "$dm_path/dm/name" 2>/dev/null || continue)
+    dm_name=$(cat "$dm_path/dm/name" 2>/dev/null || echo "")
+    [[ -z "$dm_name" ]] && continue
     sectors=$(cat "$dm_path/size" 2>/dev/null || continue)
     size_gb=$(( sectors * 512 / 1073741824 ))
     [[ $size_gb -eq 0 ]] && continue
     STR_LOGICAL+="  - /dev/mapper/$dm_name: [yellow]$size_gb GB[/yellow] (LVM/DM)"$'\n'
-    # Slaves (Tree)
-    slaves=( "$dm_path/slaves"/* )
-    scount=${#slaves[@]}
-    for ((i=0; i<scount; i++)); do
-        [[ ! -e "${slaves[$i]}" ]] && continue
-        sdev="${slaves[$i]##*/}"
-        # If it's another dm, show its mapper name
-        [[ "$sdev" == dm-* ]] && sdev="mapper/$(cat "/sys/class/block/$sdev/dm/name" 2>/dev/null || echo "$sdev")"
-        char="├─"
-        [[ $i -eq $((scount-1)) ]] && char="└─"
-        STR_LOGICAL+="    $char $sdev"$'\n'
-    done
+    # Slaves
+    if [[ -d "$dm_path/slaves" ]]; then
+        slaves=( "$dm_path/slaves"/* )
+        for ((i=0; i<${#slaves[@]}; i++)); do
+            [[ -e "${slaves[$i]}" ]] || continue
+            sdev="${slaves[$i]##*/}"
+            [[ "$sdev" == dm-* ]] && sdev="mapper/$(cat "/sys/class/block/$sdev/dm/name" 2>/dev/null || echo "$sdev")"
+            char="├─"
+            [[ $i -eq $((${#slaves[@]}-1)) ]] && char="└─"
+            STR_LOGICAL+="    $char $sdev"$'\n'
+        done
+    fi
 done
 # Btrfs Pools
 if [[ -d /sys/fs/btrfs ]]; then
     for fs_path in /sys/fs/btrfs/*; do
         [[ -f "$fs_path/label" ]] || continue
-        uuid="${fs_path##*/}"
         label=$(cat "$fs_path/label" 2>/dev/null || echo "N/A")
         profile="single"
         for p in raid0 raid1 raid10 raid5 raid6 dup; do
             [[ -d "$fs_path/allocation/data/$p" ]] && { profile="$p"; break; }
         done
         STR_LOGICAL+="  - Btrfs Pool: Label: [cyan]${label}[/cyan], Profile: [yellow]${profile}[/yellow]"$'\n'
-        # Devices (Tree)
-        devs=( "$fs_path/devices"/* )
-        dcount=${#devs[@]}
-        for ((i=0; i<dcount; i++)); do
-            [[ ! -e "${devs[$i]}" ]] && continue
-            sdev="${devs[$i]##*/}"
-            char="├─"
-            [[ $i -eq $((dcount-1)) ]] && char="└─"
-            STR_LOGICAL+="    $char $sdev"$'\n'
-        done
+        # Devices
+        if [[ -d "$fs_path/devices" ]]; then
+            devs=( "$fs_path/devices"/* )
+            for ((i=0; i<${#devs[@]}; i++)); do
+                [[ -e "${devs[$i]}" ]] || continue
+                sdev="${devs[$i]##*/}"
+                char="├─"
+                [[ $i -eq $((${#devs[@]}-1)) ]] && char="└─"
+                STR_LOGICAL+="    $char $sdev"$'\n'
+            done
+        fi
     done
 fi
 
